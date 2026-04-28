@@ -1,0 +1,71 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Virtualenvs ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Node / Frontend ----
+node_modules/
+.npm/
+.yarn/
+.pnp.*
+dist/
+build/
+.vite/
+*.local
+.eslintcache
+
+# ---- Lambda packaging artifacts ----
+lambdas/**/build/
+lambdas/**/package/
+lambdas/**/*.zip
+layers/**/python/
+layers/**/*.zip
+
+# ---- AWS / IaC ----
+.aws-sam/
+cdk.out/
+.cdk.staging/
+samconfig.toml.local
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# ---- Secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+aws-credentials*
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Logs ----
+*.log
+logs/

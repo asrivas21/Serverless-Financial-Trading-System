@@ -1,0 +1,8 @@
+# Local + CI development dependencies.
+-r lambdas/requirements.txt
+
+pytest==8.2.2
+pytest-cov==5.0.0
+moto[dynamodb,kinesis,s3,sqs,lambda,events,sns]==5.0.10
+responses==0.25.3
+flake8==7.1.0
