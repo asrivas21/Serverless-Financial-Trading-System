@@ -7,6 +7,8 @@
 #   export FINNHUB_API_KEY=xxxxxxxxxxxxxxxxxxxx   # from https://finnhub.io dashboard
 #   # optional: override the default ticker list
 #   export TICKERS="AAPL,TSLA,BTC-USD,ETH-USD"
+#   # optional (Phase 2+): publish to Kinesis. Unset = fetch-only (Phase 1 mode).
+#   export KINESIS_STREAM_NAME="financial-price-events"
 #   ./infra/scripts/03-deploy-fetcher.sh
 
 set -euo pipefail
@@ -22,6 +24,9 @@ DEFAULT_TICKERS="AAPL,TSLA,BTC-USD,ETH-USD"
 LAYER_ARN="${FETCHER_LAYER_ARN:?Set FETCHER_LAYER_ARN to the ARN printed by 02-build-fetcher-layer.sh}"
 FINNHUB_API_KEY="${FINNHUB_API_KEY:?Set FINNHUB_API_KEY (sign up free at https://finnhub.io)}"
 TICKERS="${TICKERS:-$DEFAULT_TICKERS}"
+# KINESIS_STREAM_NAME is optional: when unset, the Lambda skips publishing
+# (useful for the Phase 1 fetch-only smoke test).
+KINESIS_STREAM_NAME="${KINESIS_STREAM_NAME:-}"
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${WORKSPACE_ROOT}/lambdas/fetcher/build"
@@ -38,8 +43,9 @@ ROLE_ARN=$(aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.Arn' --outp
 
 # Use JSON for --environment instead of shorthand: shorthand uses commas to
 # separate key=value pairs, which collides with the commas in our TICKERS list.
-ENV_JSON=$(printf '{"Variables":{"TICKERS":"%s","FINNHUB_API_KEY":"%s"}}' \
-  "${TICKERS}" "${FINNHUB_API_KEY}")
+ENV_JSON=$(printf \
+  '{"Variables":{"TICKERS":"%s","FINNHUB_API_KEY":"%s","KINESIS_STREAM_NAME":"%s"}}' \
+  "${TICKERS}" "${FINNHUB_API_KEY}" "${KINESIS_STREAM_NAME}")
 
 if aws lambda get-function --function-name "${FUNCTION_NAME}" >/dev/null 2>&1; then
   echo "==> Updating function ${FUNCTION_NAME}"

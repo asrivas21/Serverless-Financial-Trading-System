@@ -34,26 +34,61 @@ aws iam create-access-key --user-name financial-pipeline-ci
 # Activate the venv so python3.12 + pip resolve correctly
 source .venv/bin/activate
 
-# 4. Build and publish the yfinance + requests layer
+# 4. Build and publish the requests layer (originally yfinance; renamed lazily)
 ./infra/scripts/02-build-fetcher-layer.sh
 # -> Copy the printed LayerVersionArn into the next step.
 export FETCHER_LAYER_ARN=arn:aws:lambda:us-east-1:...:layer:financial-pipeline-yfinance:1
 
-# 5. Create / update the fetcher Lambda function
+# 5. Create / update the fetcher Lambda function. Requires FINNHUB_API_KEY
+#    (sign up free at https://finnhub.io). KINESIS_STREAM_NAME is also read
+#    once Phase 2 step 6 has run.
+export FINNHUB_API_KEY=xxxxxxxxxxxxxxxxxxxx
 ./infra/scripts/03-deploy-fetcher.sh
 
 # 6. Smoke-test it by invoking once on demand
 aws lambda invoke --function-name financial-pipeline-fetcher /tmp/out.json
 cat /tmp/out.json | python3 -m json.tool
 
-# 7. Wire the rate(1 minute) EventBridge cron rule
+# 7. (Deferred until Phase 2 wires Kinesis) Wire the rate(1 minute)
+#    EventBridge cron rule. Running this with no Kinesis stream just burns
+#    free-tier invocations on data that goes nowhere — defer.
 ./infra/scripts/04-create-eventbridge-rule.sh
+```
 
-# 8. Watch the live tail until you see ~2 scheduled invocations, then disable
-#    the rule until Phase 2 wires Kinesis (avoid burning free-tier invocations
-#    on data that goes nowhere).
-aws logs tail /aws/lambda/financial-pipeline-fetcher --follow
-aws events disable-rule --name financial-pipeline-fetcher-cron
+### Phase 2 — Kinesis stream + Processor Lambda
+
+```bash
+# 8. Provision the Kinesis stream the fetcher publishes to.
+#    COST: ~$0.36/day per shard while the stream is up — tear down between
+#    sessions via 99-teardown.sh.
+./infra/scripts/05-create-kinesis-stream.sh
+export KINESIS_STREAM_NAME=financial-price-events
+
+# 9. Redeploy the fetcher (now publishes to Kinesis on each invocation).
+./infra/scripts/03-deploy-fetcher.sh
+
+# 10. Verify records actually land in the stream:
+aws lambda invoke --function-name financial-pipeline-fetcher /tmp/out.json
+SHARD_ITER=$(aws kinesis get-shard-iterator \
+  --stream-name financial-price-events \
+  --shard-id shardId-000000000000 \
+  --shard-iterator-type TRIM_HORIZON \
+  --query 'ShardIterator' --output text)
+aws kinesis get-records --shard-iterator "${SHARD_ITER}" --limit 10
+
+# 11. Deploy the processor Lambda (no layer needed — stdlib + boto3 only)
+./infra/scripts/06-deploy-processor.sh
+
+# 12. Create the SQS DLQ and wire Kinesis -> processor event source mapping
+./infra/scripts/07-create-event-source-mapping.sh
+
+# 13. End-to-end smoke: invoke fetcher, then watch the processor logs
+aws lambda invoke --function-name financial-pipeline-fetcher /tmp/out.json
+sleep 3
+aws logs tail /aws/lambda/financial-pipeline-processor --since 1m
+
+# At end of session, delete the Kinesis stream + event source mapping:
+./infra/scripts/99-teardown.sh
 ```
 
 ## What gets created
@@ -70,5 +105,9 @@ aws events disable-rule --name financial-pipeline-fetcher-cron
 | 1 | Lambda function | `financial-pipeline-fetcher` | us-east-1 |
 | 1 | CloudWatch log group | `/aws/lambda/financial-pipeline-fetcher` | us-east-1 |
 | 1 | EventBridge rule | `financial-pipeline-fetcher-cron` | us-east-1 |
+| 2 | Kinesis stream | `financial-price-events` | us-east-1 |
+| 2 | Lambda function | `financial-pipeline-processor` | us-east-1 |
+| 2 | SQS queue (DLQ) | `financial-pipeline-processor-dlq` | us-east-1 |
+| 2 | Event source mapping | (Kinesis → processor) | us-east-1 |
 
 Policies live in `infra/iam/*.json` and are version-controlled.

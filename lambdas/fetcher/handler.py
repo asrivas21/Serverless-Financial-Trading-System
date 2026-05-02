@@ -1,5 +1,5 @@
 """Fetcher Lambda — pulls live prices from Finnhub (stocks) and CoinGecko
-(crypto) on a cron trigger.
+(crypto) on a cron trigger and publishes them to a Kinesis Data Stream.
 
 The original PRD calls for yfinance, but Yahoo blocks the AWS Lambda IP ranges
 (returns empty 200 responses, mis-reported by yfinance as "possibly delisted").
@@ -7,18 +7,22 @@ Finnhub's free /quote endpoint is the closest drop-in: 60 calls/min free, real-
 time, JSON. Tradeoff: the free tier doesn't include volume, so stock events
 report `volume: 0`.
 
-Phase 1: build per-ticker price events and return them. Phase 2 will add the
-Kinesis publish step; keeping that out for now lets this module be unit-tested
-without any AWS dependencies.
+Kinesis publishing is gated on the KINESIS_STREAM_NAME env var: when unset
+(local dev, or Phase 1 smoke test) the handler returns events without
+publishing, which keeps it unit-testable without any AWS plumbing.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
+import boto3
 import requests
+from botocore.config import Config
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -36,6 +40,72 @@ COINGECKO_IDS: dict[str, str] = {
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 HTTP_TIMEOUT_SECS = 5
+
+# Kinesis publish tuning. put_records is bounded by Kinesis to 500 records or
+# 5 MB per call; we're well under both. Retries cover transient
+# ProvisionedThroughputExceeded errors only — other failures are logged and
+# dropped (Phase 2 acceptable; Phase 7 will add a DLQ for the publish path).
+KINESIS_MAX_RETRIES = 3
+KINESIS_RETRY_BACKOFF_SECS = 0.2
+
+# Lazy module-level client so cold-start cost is amortized across warm invokes
+# but tests that don't touch AWS don't pay it.
+_kinesis_client = None
+
+
+def _get_kinesis_client():
+    global _kinesis_client
+    if _kinesis_client is None:
+        _kinesis_client = boto3.client(
+            "kinesis",
+            config=Config(
+                connect_timeout=3,
+                read_timeout=5,
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
+        )
+    return _kinesis_client
+
+
+def publish_to_kinesis(events: list[dict], stream_name: str) -> int:
+    """Publish events to Kinesis. Returns the number successfully published.
+
+    PartitionKey is the ticker symbol so all events for the same asset land
+    on the same shard, preserving per-asset ordering (F-01 spec). Failures
+    from ProvisionedThroughputExceeded are retried with bounded backoff;
+    other failures are logged and dropped.
+    """
+    if not events:
+        return 0
+    client = _get_kinesis_client()
+    pending = [
+        {"Data": json.dumps(e).encode("utf-8"), "PartitionKey": e["ticker"]}
+        for e in events
+    ]
+    published = 0
+    for attempt in range(KINESIS_MAX_RETRIES + 1):
+        resp = client.put_records(StreamName=stream_name, Records=pending)
+        published += len(pending) - resp["FailedRecordCount"]
+        if resp["FailedRecordCount"] == 0:
+            return published
+        # Retry only the records that actually failed, preserving order.
+        retryable = []
+        for record, result in zip(pending, resp["Records"]):
+            if "ErrorCode" not in result:
+                continue
+            if result["ErrorCode"] == "ProvisionedThroughputExceededException" \
+                    and attempt < KINESIS_MAX_RETRIES:
+                retryable.append(record)
+            else:
+                logger.error(
+                    "Kinesis put failed (dropping): %s %s",
+                    result.get("ErrorCode"), result.get("ErrorMessage"),
+                )
+        if not retryable:
+            break
+        time.sleep(KINESIS_RETRY_BACKOFF_SECS * (2 ** attempt))
+        pending = retryable
+    return published
 
 
 def _is_crypto(ticker: str) -> bool:
@@ -115,7 +185,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
     tickers = [t.strip() for t in tickers_env.split(",") if t.strip()]
     if not tickers:
         logger.error("No tickers configured; set TICKERS env var")
-        return {"fetched": 0, "events": []}
+        return {"fetched": 0, "published": 0, "events": []}
 
     events: list[dict] = []
     for ticker in tickers:
@@ -124,5 +194,12 @@ def lambda_handler(event: dict, context: Any) -> dict:
             events.append(evt)
             logger.info("Fetched %s @ %s", evt["ticker"], evt["price"])
 
-    # Phase 2 will publish `events` to Kinesis here.
-    return {"fetched": len(events), "events": events}
+    stream_name = os.environ.get("KINESIS_STREAM_NAME")
+    published = 0
+    if stream_name:
+        published = publish_to_kinesis(events, stream_name)
+        logger.info("Published %d/%d events to %s", published, len(events), stream_name)
+    else:
+        logger.warning("KINESIS_STREAM_NAME not set; skipping publish")
+
+    return {"fetched": len(events), "published": published, "events": events}
